@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Datasets / model weights (downloaded automatically by the code)
+data/coco128/
+data/coco128.zip
+*.pt
+
+# Large generated artifacts -- keep the directory, ignore heavy contents
+results/data/*.npy
+results/examples/*_attacked/
+results/run_log.txt
+
+# OS
+.DS_Store
+Thumbs.db

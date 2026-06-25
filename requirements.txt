@@ -1,0 +1,23 @@
+# ---------------------------------------------------------------------------
+# SVD & YOLO for Image Steganography
+# Statistical and Mathematical Methods for AI
+# ---------------------------------------------------------------------------
+# Core scientific stack
+numpy>=1.26
+scipy>=1.11
+scikit-image>=0.22
+opencv-python-headless>=4.9
+pillow>=10.0
+matplotlib>=3.8
+seaborn>=0.13
+pandas>=2.1
+tqdm>=4.66
+
+# Deep learning / object detection (YOLOv8)
+torch>=2.2
+torchvision>=0.17
+ultralytics>=8.1
+
+# Deliverables (report PDF + slides)
+python-pptx>=0.6.23
+reportlab>=4.1
