@@ -19,3 +19,6 @@ results/run_log.txt
 # OS
 .DS_Store
 Thumbs.db
+
+# Office lock files (LibreOffice / PowerPoint)
+~$*

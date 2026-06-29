@@ -143,18 +143,20 @@ compressione SVD massimizza la capacità ma elimina la ridondanza ⇒ più fragi
 
 ---
 
-## 5. Report e PowerPoint (dai TUOI dati)
+## 5. Report e PowerPoint (deliverable per la consegna)
 
-Dopo aver eseguito gli esperimenti in locale, i deliverable si rigenerano con i
-**tuoi** numeri:
+I deliverable finali sono versionati in `docs/` e si basano integralmente sui
+risultati sperimentali (`results/summary.json`, `results/metrics_per_image.csv`,
+`results/secret_compression.csv`) e sulle figure in `results/figures/`:
 
-```bash
-python scripts/generate_report.py      # → docs/REPORT.md  e  docs/REPORT.pdf
-python scripts/generate_slides.py      # → docs/presentazione.pptx
-```
+| File | Contenuto |
+|------|-----------|
+| `docs/REPORT.md` | relazione completa (Markdown, leggibile su GitHub con le figure) |
+| `docs/REPORT.pdf` | la stessa relazione impaginata, pronta per la consegna |
+| `docs/presentazione.pptx` | presentazione (16:9) con figure e numeri reali |
 
-Entrambi leggono `results/summary.json`, `results/metrics_per_image.csv` e le
-figure in `results/figures/`. **Per la consegna**: esegui §3.2 e §3.3, poi §5.
+I numeri citati nei due documenti sono presi direttamente dai file di output:
+sono quindi sempre coerenti con l'ultima esecuzione degli esperimenti (§3.2–3.3).
 
 ---
 
