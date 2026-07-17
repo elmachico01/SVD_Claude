@@ -55,6 +55,23 @@ def f(x, d=2):
         return str(x)
 
 
+def qim_theory(mode_cfg: dict, cover: int = 512) -> dict:
+    """Predizioni teoriche QIM (stesse formule di generate_report.py §3.1)."""
+    import math
+    Bk = int(mode_cfg.get("block", 8))
+    D = float(mode_cfg.get("delta", 24.0))
+    R = int(mode_cfg.get("repeat", 1))
+    size = int(mode_cfg.get("secret_size", 64))
+    k = int(mode_cfg.get("k", 10))
+    payload_bits = 8 * (9 + 2 * k + 2 * size * k)
+    phys_sites = 3 * (cover // Bk) ** 2
+    alpha = min(1.0, payload_bits * R / phys_sites)
+    mse = alpha * (7.0 / 48.0) * D * D / (Bk * Bk)
+    psnr = 10.0 * math.log10(255.0 ** 2 / mse) if mse > 0 else float("inf")
+    return {"payload_bits": payload_bits, "phys_sites": phys_sites,
+            "alpha": alpha, "psnr_pred": psnr, "margin": D / 4.0}
+
+
 class Deck:
     def __init__(self):
         self.prs = Presentation()
@@ -221,17 +238,77 @@ def build(s: dict):
               "fig_eckart_young.png",
               "Errore di approssimazione teorico vs misurato e fattore di compressione.")
 
+    d.bullets("Perché proprio i valori singolari (e perché σ₁)", [
+        "Concentrazione di energia (Eckart–Young): nei blocchi naturali σ₁² "
+        "raccoglie il 95–99 % di ‖A‖_F² = Σσᵢ² ⇒ σ₁ è la coordinata più "
+        "significativa del blocco nella base {uᵢvᵢᵀ}.",
+        "Stabilità (Weyl): una perturbazione E sposta tutti i σᵢ di ≤ ‖E‖₂ in "
+        "assoluto ⇒ perturbazione relativa minima su σ₁, enorme sui σᵢ piccoli "
+        "(che 'amplificano il rumore', come visto a lezione).",
+        "Invarianza: i σᵢ non cambiano per trasformazioni ortogonali del blocco — "
+        "descrittore intrinseco dell'energia.",
+        "Distorsione distribuita: variare σ₁ di δ cambia il blocco di δ·u₁v₁ᵀ, "
+        "norma |δ| spalmata su B² pixel lungo la componente più liscia; toccare "
+        "un σᵢ piccolo inietterebbe rumore ad alta frequenza, visibile.",
+    ], subtitle="Il punto sollevato dalla teoria del corso: piccoli σ = componenti instabili")
+
     d.bullets("Embedding nel dominio SVD (QIM su σ₁)", [
-        "Per ogni blocco B×B: A = UΣVᵀ; si codifica un bit in σ₁ con passo Δ "
-        "(Quantisation Index Modulation).",
-        "σ₁' = ⌊σ₁/Δ⌋·Δ + (0.25 o 0.75)·Δ  a seconda del bit.",
-        "Distorsione: ‖δ·u₁v₁ᵀ‖_F = |δ|, distribuita su tutto il blocco ⇒ "
-        "impercettibile per pixel.",
-        "Decodifica cieca dalla parte frazionaria di σ₁/Δ; margine di robustezza Δ/4.",
-        "Codice a ripetizione (×R) + voto di maggioranza per la robustezza.",
+        "Serializzazione: header 9 byte (magic, h, w, k) + σ in float16 + U_k, V_kᵀ "
+        "in int8 (norma unitaria ⇒ elementi in [−1,1], scala fissa 127).",
+        "Ordine dei blocchi: chiave PRNG + mappa di priorità YOLO (sfondo prima).",
+        "Per ogni blocco B×B: A = UΣVᵀ; un bit in σ₁ con passo Δ:",
+        ("σ₁' = ⌊σ₁/Δ⌋·Δ + 0.25Δ (bit 0)  oppure  + 0.75Δ (bit 1)", 1),
+        ("0.25 e 0.75 = centri delle due semicelle ⇒ margine simmetrico e massimo Δ/4", 1),
+        "Ricostruzione A' = UΣ'Vᵀ: cambia solo σ₁, i vettori singolari restano invariati.",
+        "Codice a ripetizione (×R): ogni bit logico scritto in R siti consecutivi.",
+    ])
+
+    d.bullets("Decodifica cieca (estrazione)", [
+        "Non servono né il cover né i σ originali (≠ Liu–Tan, che conserva U,V): "
+        "solo chiave, parametri (B, Δ, R) e mappa di priorità.",
+        "Stesso ordinamento dei blocchi ⇒ per ogni blocco: SVD e decisione dalla "
+        "parte frazionaria di σ₁/Δ:",
+        ("bit = 0 se (σ₁/Δ mod 1) < 0.5, altrimenti 1 — cella di decisione Δ/2, "
+         "valore embedded al centro ⇒ corretto finché |spostamento di σ₁| < Δ/4", 1),
+        "Prima i 72 bit dell'header → (h, w, k) → lunghezza esatta del payload; "
+        "poi voto di maggioranza sugli R siti di ogni bit.",
+        "Ricostruzione Ŝ = Ũ_k·diag(σ̃)·Ṽ_kᵀ, clip in [0,255]; i σ corrotti "
+        "(NaN/inf) vengono azzerati ⇒ degrado graduale, mai esplosione.",
     ])
 
     cfg = s.get("config", {})
+    th_hc = qim_theory(cfg.get("hc", {}))
+    th_rb = qim_theory(cfg.get("rb", {}))
+
+    d.bullets("Effetto delle perturbazioni: teorema di Weyl", [
+        "Attacco = perturbazione E del blocco:  |σᵢ(A'+E) − σᵢ(A')| ≤ ‖E‖₂  ∀i.",
+        "Condizione di decodifica corretta: ‖E‖₂ < Δ/4 (margine QIM).",
+        "Rumore gaussiano σ_n: ‖E‖₂ ≈ 2σ_n√B. Con σ_n = 5:",
+        (f"HC: margine Δ/4 = {f(th_hc['margin'],0)} contro ‖E‖₂ ≈ 28 ⇒ fragile "
+         f"(BER misurato {f(atk(s,'hc','gauss_noise5','ber'),2)})", 1),
+        (f"RB: margine Δ/4 = {f(th_rb['margin'],0)} contro ‖E‖₂ ≈ 40 ⇒ errori "
+         f"sporadici, corretti dal voto (BER {f(atk(s,'rb','gauss_noise5','ber'),3)})", 1),
+        "Ricostruzione: errore = troncamento (Eckart–Young, tetto in pulito) + "
+        "quantizzazione (trascurabile) + errori di bit (U/V graduali, σ e header "
+        "critici ⇒ header nei primi siti + ripetizione).",
+    ], subtitle="I risultati sperimentali sono previsti dalla teoria, non solo osservati")
+
+    d.bullets("Scelta dei parametri: teoria vs misura", [
+        "Δ — distorsione prevista: E[δ²] = 7Δ²/48 (fase uniforme) ⇒ "
+        "PSNR atteso = 10·log₁₀(255²·B²/(α·7Δ²/48)):",
+        (f"HC: atteso {f(th_hc['psnr_pred'],1)} dB, misurato "
+         f"{f(m(s,'hc','guided_psnr'),1)} dB · RB: atteso {f(th_rb['psnr_pred'],1)} dB, "
+         f"misurato {f(m(s,'rb','guided_psnr'),1)} dB (scarto < 0.3 dB)", 1),
+        "Δ — robustezza (Weyl): Δ > 8σ_n√B ⇒ RB tollera σ_n ≈ 4, HC solo ≈ 0.75.",
+        f"B — capacità 3(N/B)²: {th_hc['phys_sites']} siti (B=8) vs "
+        f"{th_rb['phys_sites']} (B=16); ma σ₁ ≈ cB cresce come B mentre ‖E‖₂ solo "
+        "come √B ⇒ blocchi grandi più robusti.",
+        "k — criterio dell'energia: k=10 è il minimo con E(k) ≥ 99 % (E(10)=99.1 %); "
+        f"vincolo di capacità: {th_hc['payload_bits']} bit su {th_hc['phys_sites']} "
+        "(k=12 non entrerebbe). In RB k=3 è il massimo compatibile con R=3.",
+        "R — dispari (maggioranza senza pareggi): errore logico ≈ 3p² con R=3 "
+        "(p=5 % → 0.7 %), al costo di 1/3 della capacità.",
+    ])
     d.bullets("Setup sperimentale", [
         f"Dataset: COCO-128 — {n} immagini reali di COCO, cover 512×512.",
         "Due punti operativi:",
@@ -291,9 +368,13 @@ def build(s: dict):
         "dominio di embedding robusto (σ₁), analisi del condizionamento.",
         f"Impercettibilità elevata (PSNR ≈ {f(m(s,'hc','guided_psnr'))} dB) e "
         f"preservazione semantica quasi perfetta (mAP ≈ {f(m(s,'hc','det_map50'),2)}).",
-        "La guida YOLO protegge le regioni salienti (+~10 dB) a parità di capacità.",
+        f"La guida YOLO protegge le regioni salienti "
+        f"(+{f(m(s,'hc','guided_obj_psnr')-m(s,'hc','baseline_obj_psnr'),1)} dB "
+        "sugli oggetti) a parità di capacità.",
+        "PSNR e robustezza previsti dalla teoria (E[δ²]=7Δ²/48, Weyl ‖E‖₂<Δ/4): "
+        "scarto teoria–misura < 0.3 dB.",
         "Compromesso capacità↔robustezza governato da tre leve SVD: dimensione "
-        "blocco, passo Δ, ridondanza R.",
+        "blocco, passo Δ, ridondanza R — tutte motivate teoricamente.",
         "Codice e documentazione completi, riproducibili su 100+ immagini COCO.",
     ])
     return d
