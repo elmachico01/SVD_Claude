@@ -64,9 +64,10 @@ def default_secret(size: int = 64) -> np.ndarray:
     fast-decaying singular-value spectrum, which makes it an ideal subject for
     the truncated-SVD compression demonstration.
     """
-    s = np.zeros((size, size), dtype=np.float32)
     yy, xx = np.mgrid[0:size, 0:size]
-    s += 50 + 70 * (xx / size) + 50 * (yy / size)        # smooth low-rank gradient
+    grad = 50 + 70 * (xx / size) + 50 * (yy / size)      # smooth low-rank gradient
+    # uint8 canvas: OpenCV ≥ 5 requires CV_8U for the drawing primitives below
+    s = np.clip(grad, 0, 255).astype(np.uint8)
     c = size // 2
     cv2.circle(s, (c, c), int(size * 0.38), 235, -1)      # bold disk (dominant component)
     cv2.circle(s, (c, c), int(size * 0.20), 40, -1)       # inner contrast disk (the "ring")
@@ -75,7 +76,7 @@ def default_secret(size: int = 64) -> np.ndarray:
     if size >= 48:                                        # text only when legible
         cv2.putText(s, "SVD", (int(size * 0.07), size - max(4, size // 12)),
                     cv2.FONT_HERSHEY_SIMPLEX, size / 110.0, 15, 1, cv2.LINE_AA)
-    return np.clip(s, 0, 255).astype(np.uint8)
+    return s
 
 
 def image_as_secret(path: str | Path, size: int = 64) -> np.ndarray:

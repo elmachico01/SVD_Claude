@@ -165,8 +165,14 @@ figure in `results/figures/`. **Per la consegna**: esegui §3.2 e §3.3, poi §5
 | SVD `A = UΣVᵀ` | `svd_core.svd_decompose` |
 | SVD troncata / Eckart–Young | `svd_core.truncated_svd`, `eckart_young_errors`; compressione segreto |
 | Fattore di compressione `k(m+n+1)/mn` | `svd_core.compression_factor` |
+| Criterio dell'energia `E(k)` per la scelta di `k` | `svd_core.energy_ratio`, `rank_for_energy`; `THEORY.md` §8.3 |
 | SVD ↔ autovalori `σ_i=√λ_i` | `svd_core.verify_svd_eigendecomposition` |
 | Numero di condizionamento `κ=σ₁/σₙ` | `svd_core.condition_number` |
+| Piccoli σ amplificano il rumore → embedding in σ₁ | `THEORY.md` §5, §6.1; `steganography._qim_embed_sigma1` |
+| Perturbazione dei valori singolari (teorema di Weyl) | `THEORY.md` §7; esperimenti di robustezza |
 | Pseudoinversa / minimi quadrati | `svd_core.pseudoinverse`, `lstsq_via_svd` |
 
-Vedi `docs/THEORY.md` per il dettaglio matematico.
+Vedi `docs/THEORY.md` per il dettaglio matematico. In particolare: §6 (embedding
+e decodifica passo-passo, ruolo dei valori singolari), §7 (effetto delle
+perturbazioni su decodifica e ricostruzione, teorema di Weyl), §8 (motivazione
+teorica di tutti i parametri `Δ`, `B`, `k`, `R`, con PSNR previsto vs misurato).
