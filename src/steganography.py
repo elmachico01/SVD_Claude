@@ -1,153 +1,117 @@
-"""
-steganography.py
-================
-The SVD-based steganography engine.
+"""SVD-based image steganography.
 
-The scheme has two SVD stages, both grounded in the course material:
+The module separates two ideas:
+1. truncated-SVD compression of a grayscale secret;
+2. block-SVD QIM embedding of the resulting bitstream.
 
-1. **Secret compression — truncated SVD (Eckart–Young).**
-   The secret image S is replaced by its best rank-``k`` approximation and
-   stored as the compact factors (U_k, σ_k, V_kᵀ).  This *dimensionality
-   reduction* shrinks the payload from m·n numbers to k(m+n+1), exactly the
-   compression accounting of the lecture, so that a sizeable secret fits inside
-   a single cover image.
-
-2. **Cover embedding — block-wise SVD + QIM.**
-   The cover is split into B×B blocks.  Each carrier block A = UΣVᵀ has its
-   largest singular value σ₁ quantised (Quantisation Index Modulation) to carry
-   one payload bit.  σ₁ concentrates almost all of the block energy
-   (Eckart–Young), so it is the most stable place to hide information and the
-   change ‖δ·u₁v₁ᵀ‖_F = |δ| is spread over the whole block — imperceptible per
-   pixel.
-
-The order in which blocks are filled is decided by a *priority map* (see
-``yolo_guidance``): background blocks first, salient/object blocks last.  This
-keeps the visually-important and semantically-important regions almost
-untouched.  A pseudo-random key breaks ties and provides a keyed permutation
-fallback that needs no detector at extraction time.
+Two extraction modes are deliberately distinguished:
+- keyed/blind: the carrier order depends only on ``key``;
+- guided: the carrier order also depends on a priority map, which is side
+  information and must be available unchanged at extraction time.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import zlib
 import numpy as np
 
 from . import svd_core
 
 MAGIC = b"SV"
-VERSION = 1
-HEADER_BYTES = 9                 # magic(2) + version(1) + h(2) + w(2) + k(2)
+VERSION = 2
+# magic(2) + version(1) + h(2) + w(2) + k(2) + payload_crc32(4)
+HEADER_BYTES = 13
 HEADER_BITS = HEADER_BYTES * 8
 
 
-# ===========================================================================
-# Secret codec  (stage 1: truncated SVD compression + serialisation)
-# ===========================================================================
-def compress_secret(secret_gray: np.ndarray, k: int) -> bytes:
-    """
-    Compress a grayscale secret image into a self-describing byte payload using
-    its rank-``k`` truncated SVD.
+@dataclass
+class DecodeStatus:
+    header_ok: bool
+    crc_ok: bool
+    message: str = ""
 
-    Layout (fixed 9-byte self-describing header, no length prefix):
-        magic(2) | version(1) | h(2) | w(2) | k(2) |
-        σ_k  : k × float16 |
-        U_k  : h·k × int8  (entries scaled by 127) |
-        V_kᵀ : k·w × int8
-    The payload length is fully determined by (h, w, k), so the decoder reads
-    the header first and then exactly the right number of bits.
-    """
+
+# ---------------------------------------------------------------------------
+# Secret codec
+# ---------------------------------------------------------------------------
+def _payload_body(secret_gray: np.ndarray, k: int) -> tuple[bytes, int, int, int]:
     S = np.asarray(secret_gray, dtype=np.float64)
     if S.ndim != 2:
         raise ValueError("secret must be a 2-D grayscale image")
     h, w = S.shape
     k = int(np.clip(k, 1, min(h, w)))
-
     svd = svd_core.svd_decompose(S)
     Uk, sk, Vtk = svd_core.low_rank_components(svd, k)
+    Uq = np.clip(np.rint(Uk * 127.0), -127, 127).astype(np.int8)
+    Vq = np.clip(np.rint(Vtk * 127.0), -127, 127).astype(np.int8)
+    body = sk.astype("<f2").tobytes() + Uq.tobytes() + Vq.tobytes()
+    return body, h, w, k
 
-    Uq = np.clip(np.round(Uk * 127), -127, 127).astype(np.int8)
-    Vq = np.clip(np.round(Vtk * 127), -127, 127).astype(np.int8)
-    sq = sk.astype(np.float16)
 
-    body = bytearray()
-    body += MAGIC
-    body += bytes([VERSION])
-    body += int(h).to_bytes(2, "big")
-    body += int(w).to_bytes(2, "big")
-    body += int(k).to_bytes(2, "big")
-    body += sq.tobytes()
-    body += Uq.tobytes()
-    body += Vq.tobytes()
-    return bytes(body)
+def compress_secret(secret_gray: np.ndarray, k: int) -> bytes:
+    """Serialize a rank-k approximation using int8 factors and float16 values."""
+    body, h, w, k = _payload_body(secret_gray, k)
+    crc = zlib.crc32(body) & 0xFFFFFFFF
+    header = (MAGIC + bytes([VERSION]) + h.to_bytes(2, "big")
+              + w.to_bytes(2, "big") + k.to_bytes(2, "big")
+              + crc.to_bytes(4, "big"))
+    return header + body
 
 
 def payload_size_bytes(h: int, w: int, k: int) -> int:
-    """Total payload size for a rank-k secret of size h×w (header included)."""
     return HEADER_BYTES + 2 * k + h * k + k * w
 
 
-def decompress_secret(payload: bytes) -> np.ndarray:
-    """
-    Inverse of :func:`compress_secret` → recovered grayscale image (uint8).
-
-    The parser is defensive: if the payload is corrupted (e.g. after an attack)
-    it validates the header and pads/truncates the body so that it never raises
-    on a size mismatch (it raises only on an implausible/garbage header, which
-    the caller is expected to catch).
-    """
-    body = bytes(payload)
-    if body[:2] != MAGIC:
-        raise ValueError("bad magic — payload corrupted")
-    off = 3  # magic(2) + version(1)
-    h = int.from_bytes(body[off:off + 2], "big"); off += 2
-    w = int.from_bytes(body[off:off + 2], "big"); off += 2
-    k = int.from_bytes(body[off:off + 2], "big"); off += 2
+def parse_header(payload: bytes) -> tuple[int, int, int, int]:
+    if len(payload) < HEADER_BYTES or payload[:2] != MAGIC:
+        raise ValueError("header magic not found")
+    if payload[2] != VERSION:
+        raise ValueError(f"unsupported payload version {payload[2]}")
+    h = int.from_bytes(payload[3:5], "big")
+    w = int.from_bytes(payload[5:7], "big")
+    k = int.from_bytes(payload[7:9], "big")
+    crc = int.from_bytes(payload[9:13], "big")
     if not (0 < h <= 1024 and 0 < w <= 1024 and 0 < k <= min(h, w)):
         raise ValueError(f"implausible header h={h} w={w} k={k}")
+    return h, w, k, crc
 
+
+def decompress_secret(payload: bytes, verify_crc: bool = True) -> np.ndarray:
+    h, w, k, expected_crc = parse_header(payload)
     need = 2 * k + h * k + k * w
-    chunk = body[off:off + need]
-    if len(chunk) < need:                      # pad if the payload was truncated
-        chunk = chunk + b"\x00" * (need - len(chunk))
-
-    sk = np.frombuffer(chunk[:2 * k], dtype=np.float16).astype(np.float64)
-    sk = np.nan_to_num(sk, nan=0.0, posinf=0.0, neginf=0.0)   # corrupted σ → 0
+    body = bytes(payload[HEADER_BYTES:HEADER_BYTES + need])
+    if len(body) != need:
+        raise ValueError("truncated payload")
+    if verify_crc and (zlib.crc32(body) & 0xFFFFFFFF) != expected_crc:
+        raise ValueError("payload CRC mismatch")
+    sk = np.frombuffer(body[:2 * k], dtype="<f2").astype(np.float64)
     p = 2 * k
-    Uq = np.frombuffer(chunk[p:p + h * k], dtype=np.int8).astype(np.float64).reshape(h, k)
+    Uq = np.frombuffer(body[p:p + h * k], dtype=np.int8).astype(np.float64).reshape(h, k)
     p += h * k
-    Vq = np.frombuffer(chunk[p:p + k * w], dtype=np.int8).astype(np.float64).reshape(k, w)
-
+    Vq = np.frombuffer(body[p:p + k * w], dtype=np.int8).astype(np.float64).reshape(k, w)
     recon = (Uq / 127.0 * sk) @ (Vq / 127.0)
-    recon = np.nan_to_num(recon, nan=0.0, posinf=255.0, neginf=0.0)
-    return np.clip(np.round(recon), 0, 255).astype(np.uint8)
+    return np.clip(np.rint(np.nan_to_num(recon)), 0, 255).astype(np.uint8)
 
 
 def secret_compression_report(secret_gray: np.ndarray, k: int) -> dict:
-    """Compression-factor and reconstruction quality of the rank-k secret."""
+    from .metrics import psnr, normalized_correlation
     S = np.asarray(secret_gray, dtype=np.float64)
-    h, w = S.shape
     payload = compress_secret(S, k)
-    recon = decompress_secret(payload)
-    store = svd_core.storage_floats(h, w, k)
+    rec = decompress_secret(payload)
+    h, w = S.shape
     svd = svd_core.svd_decompose(S)
     return {
-        "k": int(k),
-        "payload_bytes": len(payload),
+        "k": int(k), "payload_bytes": len(payload),
         "compression_factor": svd_core.compression_factor(h, w, k),
         "energy_ratio": svd_core.energy_ratio(svd, k),
-        "store_full_floats": store["full"],
-        "store_rank_k_floats": store["rank_k"],
-        "recon_psnr": _psnr(S, recon),
+        "recon_psnr": psnr(S, rec),
+        "recon_nc": normalized_correlation(S, rec),
     }
 
 
-def _psnr(a, b):
-    from .metrics import psnr
-    return psnr(a, b)
-
-
-# ===========================================================================
+# ---------------------------------------------------------------------------
 # Bit helpers
-# ===========================================================================
+# ---------------------------------------------------------------------------
 def bytes_to_bits(data: bytes) -> np.ndarray:
     return np.unpackbits(np.frombuffer(data, dtype=np.uint8))
 
@@ -156,168 +120,166 @@ def bits_to_bytes(bits: np.ndarray) -> bytes:
     bits = np.asarray(bits, dtype=np.uint8).ravel()
     pad = (-len(bits)) % 8
     if pad:
-        bits = np.concatenate([bits, np.zeros(pad, dtype=np.uint8)])
+        bits = np.pad(bits, (0, pad))
     return np.packbits(bits).tobytes()
 
 
-# ===========================================================================
-# Block-SVD QIM embedding  (stage 2)
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Block-QIM
+# ---------------------------------------------------------------------------
 @dataclass
 class EmbedConfig:
-    block: int = 8                       # block side B
-    delta: float = 40.0                  # QIM quantisation step Δ
-    channels: tuple[int, ...] = (0, 1, 2)  # cover channels used as carriers
-    key: int = 2024                      # PRNG key for the (tie-break) permutation
-    repeat: int = 1                      # repetition factor (majority-vote ECC)
+    block: int = 8
+    delta: float = 40.0
+    channels: tuple[int, ...] = (0, 1, 2)
+    key: int = 2024
+    repeat: int = 1
+    verify_after_quantization: bool = True
+
+    def __post_init__(self):
+        if self.block <= 0 or self.delta <= 0:
+            raise ValueError("block and delta must be positive")
+        if self.repeat <= 0 or self.repeat % 2 == 0:
+            raise ValueError("repeat must be a positive odd integer")
 
 
 @dataclass
 class EmbedResult:
-    stego: np.ndarray                    # uint8 (H, W, 3)
-    num_bits: int                        # bits actually written
-    order: np.ndarray = field(repr=False)  # ordered carrier-site indices used
+    stego: np.ndarray
+    num_bits: int
+    order: np.ndarray = field(repr=False)
     capacity_bits: int = 0
+    corrected_sites: int = 0
 
 
 def _site_grid(shape, block, channels):
-    """All candidate carrier sites as an array of (channel, by, bx)."""
     H, W = shape[:2]
     nby, nbx = H // block, W // block
     sites = [(c, by, bx) for c in channels for by in range(nby) for bx in range(nbx)]
-    return np.array(sites, dtype=np.int64), (nby, nbx)
+    return np.asarray(sites, dtype=np.int64), (nby, nbx)
 
 
-def embedding_order(shape, cfg: EmbedConfig,
-                    priority_map: np.ndarray | None = None) -> np.ndarray:
-    """
-    Deterministic ordering of carrier sites, identical at embed and extract.
-
-    Sorting key = (priority value, keyed-random tie-break).  With
-    ``priority_map`` low values are filled first (background → objects);
-    without it the order is a pure keyed permutation (blind, detector-free).
-    """
+def embedding_order(shape, cfg: EmbedConfig, priority_map: np.ndarray | None = None) -> np.ndarray:
     sites, (nby, nbx) = _site_grid(shape, cfg.block, cfg.channels)
     rng = np.random.default_rng(cfg.key)
-    tie = rng.permutation(len(sites)).astype(np.float64)
-
+    tie = rng.random(len(sites))
     if priority_map is None:
-        primary = tie
-        order = np.argsort(primary, kind="stable")
-    else:
-        pm = np.asarray(priority_map, dtype=np.float64)
-        if pm.shape != (nby, nbx):
-            # resize priority map to the block grid
-            import cv2
-            pm = cv2.resize(pm, (nbx, nby), interpolation=cv2.INTER_AREA)
-        prio = pm[sites[:, 1], sites[:, 2]]
-        # stable lexsort: primary = priority, secondary = keyed tie-break
-        order = np.lexsort((tie, prio))
-    return sites[order]
+        return sites[np.argsort(tie, kind="stable")]
+    import cv2
+    pm = np.asarray(priority_map, dtype=np.float64)
+    if pm.shape != (nby, nbx):
+        pm = cv2.resize(pm, (nbx, nby), interpolation=cv2.INTER_AREA)
+    prio = pm[sites[:, 1], sites[:, 2]]
+    return sites[np.lexsort((tie, prio))]
 
 
-def _qim_embed_sigma1(block: np.ndarray, bit: int, delta: float) -> np.ndarray:
-    svd = svd_core.svd_decompose(block)
-    s = svd.s.copy()
-    q = np.floor(s[0] / delta)
-    s[0] = q * delta + (0.75 if bit else 0.25) * delta
-    return (svd.U * s) @ svd.Vt
+def _nearest_qim_target(sigma: float, bit: int, delta: float) -> float:
+    """Nearest point in the QIM coset b (minimum-distortion quantizer)."""
+    offset = (0.25 if bit == 0 else 0.75) * delta
+    q = max(0, int(np.rint((sigma - offset) / delta)))
+    return q * delta + offset
 
 
 def _qim_read_sigma1(block: np.ndarray, delta: float) -> int:
     s0 = svd_core.svd_decompose(block).s[0]
-    frac = s0 / delta - np.floor(s0 / delta)
-    return int(frac >= 0.5)
+    return int((s0 / delta - np.floor(s0 / delta)) >= 0.5)
+
+
+def _qim_embed_sigma1(block: np.ndarray, bit: int, delta: float,
+                      verify: bool = True) -> tuple[np.ndarray, bool]:
+    svd = svd_core.svd_decompose(block)
+    s = svd.s.copy()
+    s[0] = _nearest_qim_target(float(s[0]), bit, delta)
+    candidate = (svd.U * s) @ svd.Vt
+    quantized = np.clip(np.rint(candidate), 0, 255).astype(np.uint8)
+    if not verify or _qim_read_sigma1(quantized, delta) == bit:
+        return quantized, False
+    # Rare clipping/rounding failure: move one lattice step deeper in the same coset.
+    s[0] += delta
+    candidate = (svd.U * s) @ svd.Vt
+    quantized = np.clip(np.rint(candidate), 0, 255).astype(np.uint8)
+    return quantized, True
+
+
+def _physical_order(order: np.ndarray, repeat: int, key: int) -> np.ndarray:
+    """Interleave repetitions so replicas are not adjacent/correlated sites."""
+    if repeat == 1:
+        return order
+    n = len(order) // repeat
+    rng = np.random.default_rng(key + 991)
+    chunks = []
+    for r in range(repeat):
+        chunk = order[r * n:(r + 1) * n].copy()
+        rng.shuffle(chunk)
+        chunks.append(chunk)
+    return np.stack(chunks, axis=1).reshape(-1, 3)
+
+
+def capacity_bits(shape, cfg: EmbedConfig) -> int:
+    physical = len(cfg.channels) * (shape[0] // cfg.block) * (shape[1] // cfg.block)
+    return physical // cfg.repeat
 
 
 def embed_bits(cover: np.ndarray, bits: np.ndarray, cfg: EmbedConfig,
                priority_map: np.ndarray | None = None) -> EmbedResult:
-    """
-    Embed a *logical* bit array into the cover.
-
-    With ``cfg.repeat = R`` each logical bit is written into R consecutive
-    carrier sites (repetition code); extraction recovers it by majority vote.
-    """
-    cover = np.asarray(cover)
-    B = cfg.block
-    order = embedding_order(cover.shape, cfg, priority_map)
     logical = np.asarray(bits, dtype=np.uint8).ravel()
-    phys = np.repeat(logical, cfg.repeat)            # repetition coding
-    if len(phys) > len(order):
-        raise ValueError(f"payload {len(phys)} physical bits exceeds capacity "
-                         f"{len(order)} bits (logical={len(logical)}, R={cfg.repeat})")
-
-    work = cover.astype(np.float64).copy()
-    for i, bit in enumerate(phys):
+    base_order = embedding_order(cover.shape, cfg, priority_map)
+    cap = len(base_order) // cfg.repeat
+    if len(logical) > cap:
+        raise ValueError(f"payload {len(logical)} bits exceeds capacity {cap}")
+    order = _physical_order(base_order, cfg.repeat, cfg.key)
+    work = np.asarray(cover, dtype=np.uint8).copy()
+    corrected = 0
+    B = cfg.block
+    for i, bit in enumerate(np.repeat(logical, cfg.repeat)):
         c, by, bx = order[i]
         y0, x0 = by * B, bx * B
-        blk = work[y0:y0 + B, x0:x0 + B, c]
-        work[y0:y0 + B, x0:x0 + B, c] = _qim_embed_sigma1(blk, int(bit), cfg.delta)
-
-    stego = np.clip(np.round(work), 0, 255).astype(np.uint8)
-    return EmbedResult(stego=stego, num_bits=len(logical),
-                       order=order, capacity_bits=len(order) // cfg.repeat)
+        qblk, was_corrected = _qim_embed_sigma1(
+            work[y0:y0+B, x0:x0+B, c], int(bit), cfg.delta,
+            cfg.verify_after_quantization)
+        work[y0:y0+B, x0:x0+B, c] = qblk
+        corrected += int(was_corrected)
+    return EmbedResult(work, len(logical), order, cap, corrected)
 
 
 def extract_bits(stego: np.ndarray, num_bits: int, cfg: EmbedConfig,
                  priority_map: np.ndarray | None = None) -> np.ndarray:
-    """Read ``num_bits`` *logical* bits using the same ordering + majority vote."""
-    stego = np.asarray(stego)
+    base_order = embedding_order(stego.shape, cfg, priority_map)
+    if num_bits > len(base_order) // cfg.repeat:
+        raise ValueError("requested bit count exceeds capacity")
+    order = _physical_order(base_order, cfg.repeat, cfg.key)
     B = cfg.block
-    R = cfg.repeat
-    order = embedding_order(stego.shape, cfg, priority_map)
-    work = stego.astype(np.float64)
-    phys = np.empty(num_bits * R, dtype=np.uint8)
-    for i in range(num_bits * R):
+    phys = np.empty(num_bits * cfg.repeat, dtype=np.uint8)
+    for i in range(len(phys)):
         c, by, bx = order[i]
         y0, x0 = by * B, bx * B
-        blk = work[y0:y0 + B, x0:x0 + B, c]
-        phys[i] = _qim_read_sigma1(blk, cfg.delta)
-    if R == 1:
+        phys[i] = _qim_read_sigma1(stego[y0:y0+B, x0:x0+B, c], cfg.delta)
+    if cfg.repeat == 1:
         return phys
-    votes = phys.reshape(num_bits, R).sum(axis=1)
-    return (votes > (R / 2.0)).astype(np.uint8)       # ties → 0
-
-
-# ===========================================================================
-# High-level API: hide / reveal a secret image
-# ===========================================================================
-def capacity_bits(shape, cfg: EmbedConfig) -> int:
-    """Number of *logical* bits that can be stored (physical sites // repeat)."""
-    H, W = shape[:2]
-    physical = len(cfg.channels) * (H // cfg.block) * (W // cfg.block)
-    return physical // cfg.repeat
+    return (phys.reshape(num_bits, cfg.repeat).sum(axis=1) > cfg.repeat / 2).astype(np.uint8)
 
 
 def hide_secret(cover: np.ndarray, secret_gray: np.ndarray, k: int,
-                cfg: EmbedConfig,
-                priority_map: np.ndarray | None = None) -> tuple[EmbedResult, bytes]:
-    """Compress the secret (truncated SVD) then embed it into the cover."""
+                cfg: EmbedConfig, priority_map: np.ndarray | None = None) -> tuple[EmbedResult, bytes]:
     payload = compress_secret(secret_gray, k)
     bits = bytes_to_bits(payload)
-    cap = capacity_bits(cover.shape, cfg)
-    if len(bits) > cap:
-        raise ValueError(
-            f"secret needs {len(bits)} bits but cover capacity is {cap} bits; "
-            f"reduce k, enlarge the cover, or use more channels")
-    res = embed_bits(cover, bits, cfg, priority_map)
-    return res, payload
+    return embed_bits(cover, bits, cfg, priority_map), payload
 
 
 def reveal_secret(stego: np.ndarray, cfg: EmbedConfig,
-                  priority_map: np.ndarray | None = None) -> np.ndarray:
-    """Blindly recover the secret image from a (possibly attacked) stego image."""
-    # 1) read the fixed 9-byte header to learn (h, w, k)
-    header_bits = extract_bits(stego, HEADER_BITS, cfg, priority_map)
-    header = bits_to_bytes(header_bits)
-    if header[:2] != MAGIC:
-        raise ValueError("header magic not found — wrong key/params or corruption")
-    h = int.from_bytes(header[3:5], "big")
-    w = int.from_bytes(header[5:7], "big")
-    k = int.from_bytes(header[7:9], "big")
-    if not (0 < h <= 1024 and 0 < w <= 1024 and 0 < k <= min(h, w)):
-        raise ValueError(f"implausible header h={h} w={w} k={k}")
-    # 2) read exactly the payload the header describes, then decode
-    total_bits = min(payload_size_bytes(h, w, k) * 8, capacity_bits(stego.shape, cfg) * 1)
-    all_bits = extract_bits(stego, total_bits, cfg, priority_map)
-    return decompress_secret(bits_to_bytes(all_bits))
+                  priority_map: np.ndarray | None = None,
+                  return_status: bool = False):
+    """Recover the secret. A priority map, when supplied, is side information."""
+    try:
+        header = bits_to_bytes(extract_bits(stego, HEADER_BITS, cfg, priority_map))
+        h, w, k, _ = parse_header(header)
+        total_bits = payload_size_bytes(h, w, k) * 8
+        payload = bits_to_bytes(extract_bits(stego, total_bits, cfg, priority_map))
+        rec = decompress_secret(payload, verify_crc=True)
+        status = DecodeStatus(True, True, "ok")
+    except Exception as exc:
+        status = DecodeStatus(False, False, str(exc))
+        if not return_status:
+            raise
+        rec = None
+    return (rec, status) if return_status else rec
