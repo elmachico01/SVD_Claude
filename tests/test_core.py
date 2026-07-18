@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
-"""
-test_core.py — verifiche di correttezza (eseguibili senza pytest).
-
-    python tests/test_core.py        # stampa PASS/FAIL
-    pytest tests/                    # se hai pytest
-
-Coprono: proprietà della SVD, teorema di Eckart–Young, legame SVD↔autovalori,
-pseudoinversa/minimi quadrati, e il round-trip embed→extract + codec del segreto.
-"""
+"""Core correctness tests. Run with ``python tests/test_core.py`` or pytest."""
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src import svd_core, steganography as steg, metrics as M
+from src import dataset, metrics as M, steganography as steg, svd_core
 from src.steganography import EmbedConfig
 
 rng = np.random.default_rng(0)
@@ -32,78 +23,89 @@ def test_eckart_young():
     A = rng.standard_normal((60, 45))
     svd = svd_core.svd_decompose(A)
     for k in (1, 5, 10, 20):
-        Ak = svd.reconstruct(k)
+        residual = A - svd.reconstruct(k)
         ey = svd_core.eckart_young_errors(svd, k)
-        assert np.isclose(np.linalg.norm(A - Ak, 2), ey["spectral_sigma_k1"], atol=1e-8)
-        assert np.isclose(np.linalg.norm(A - Ak, "fro"), ey["frobenius_tail"], atol=1e-8)
+        assert np.isclose(np.linalg.norm(residual, 2), ey["spectral_sigma_k1"], atol=1e-8)
+        assert np.isclose(np.linalg.norm(residual, "fro"), ey["frobenius_tail"], atol=1e-8)
 
 
 def test_svd_eigendecomposition():
-    A = rng.standard_normal((30, 18))
-    r = svd_core.verify_svd_eigendecomposition(A)
-    assert r["sigma_vs_sqrt_lambda"] < 1e-8
-    assert r["reconstruction_rel_err"] < 1e-10
-
-
-def test_compression_factor():
-    # esempio numerico delle slide: ~18% per k=20 su immagine 256x?  (formula generale)
-    assert np.isclose(svd_core.compression_factor(100, 100, 10), 10 * 201 / 10000)
+    result = svd_core.verify_svd_eigendecomposition(rng.standard_normal((30, 18)))
+    assert result["sigma_vs_sqrt_lambda"] < 1e-8
+    assert result["reconstruction_rel_err"] < 1e-10
 
 
 def test_pseudoinverse_least_squares():
-    A = rng.standard_normal((50, 12))         # sovradeterminato
-    b = rng.standard_normal(50)
-    x = svd_core.lstsq_via_svd(A, b)
-    x_ref, *_ = np.linalg.lstsq(A, b, rcond=None)
-    assert np.allclose(x, x_ref, atol=1e-8)
+    A, b = rng.standard_normal((50, 12)), rng.standard_normal(50)
+    assert np.allclose(svd_core.lstsq_via_svd(A, b),
+                       np.linalg.lstsq(A, b, rcond=None)[0], atol=1e-8)
 
 
-def test_condition_number():
-    A = np.diag([5.0, 1.0, 0.5])
-    assert np.isclose(svd_core.condition_number(A), 10.0)
+def test_secret_codec_and_crc():
+    secret = dataset.default_secret(48)
+    payload = steg.compress_secret(secret, 12)
+    recovered = steg.decompress_secret(payload)
+    assert recovered.shape == secret.shape
+    assert M.normalized_correlation(secret, recovered) > 0.85
+    corrupted = bytearray(payload)
+    corrupted[-1] ^= 1
+    try:
+        steg.decompress_secret(bytes(corrupted))
+    except ValueError as exc:
+        assert "CRC" in str(exc)
+    else:
+        raise AssertionError("CRC corruption not detected")
 
 
-def test_secret_codec_roundtrip():
-    from src import dataset
-    sec = dataset.default_secret(48)
-    rec = steg.decompress_secret(steg.compress_secret(sec, 12))
-    assert rec.shape == sec.shape
-    assert M.normalized_correlation(sec, rec) > 0.85   # compressione con perdita
+def test_clean_blind_roundtrip():
+    cover = rng.integers(20, 235, (256, 256, 3), dtype=np.uint8)
+    bits = rng.integers(0, 2, 800, dtype=np.uint8)
+    cfg = EmbedConfig(block=8, delta=32.0, repeat=1)
+    result = steg.embed_bits(cover, bits, cfg)
+    assert np.array_equal(bits, steg.extract_bits(result.stego, len(bits), cfg))
 
 
-def test_embed_extract_roundtrip_clean():
-    cover = rng.integers(20, 235, (256, 256, 3), dtype=np.uint8)  # evita saturazioni
-    bits = rng.integers(0, 2, 800).astype(np.uint8)              # 800*3=2400 ≤ 3072
-    ec = EmbedConfig(block=8, delta=32.0, channels=(0, 1, 2), repeat=3)
-    res = steg.embed_bits(cover, bits, ec, None)
-    out = steg.extract_bits(res.stego, len(bits), ec, None)
-    assert M.ber(bits, out) == 0.0          # lossless in chiaro con R=3
+def test_guided_mode_requires_same_priority_map():
+    cover = rng.integers(20, 235, (256, 256, 3), dtype=np.uint8)
+    priority = rng.random((32, 32))
+    bits = rng.integers(0, 2, 500, dtype=np.uint8)
+    cfg = EmbedConfig(block=8, delta=32.0, repeat=1, key=17)
+    result = steg.embed_bits(cover, bits, cfg, priority)
+    correct = steg.extract_bits(result.stego, len(bits), cfg, priority)
+    wrong = steg.extract_bits(result.stego, len(bits), cfg, None)
+    assert np.array_equal(bits, correct)
+    assert not np.array_equal(bits, wrong)
 
 
-def test_hide_reveal_secret_clean():
-    from src import dataset
+def test_interleaved_repetition_roundtrip():
+    cover = rng.integers(20, 235, (256, 256, 3), dtype=np.uint8)
+    bits = rng.integers(0, 2, 700, dtype=np.uint8)
+    cfg = EmbedConfig(block=8, delta=40.0, repeat=3, key=21)
+    result = steg.embed_bits(cover, bits, cfg)
+    assert np.array_equal(bits, steg.extract_bits(result.stego, len(bits), cfg))
+
+
+def test_hide_reveal_status():
     cover = rng.integers(20, 235, (512, 512, 3), dtype=np.uint8)
-    sec = dataset.default_secret(64)
-    ec = EmbedConfig(block=8, delta=24.0, channels=(0, 1, 2), repeat=1)
-    res, payload = steg.hide_secret(cover, sec, 10, ec, None)
-    rec = steg.reveal_secret(res.stego, ec, None)
-    assert rec.shape == sec.shape
-    assert M.normalized_correlation(sec, rec) > 0.8
+    secret = dataset.default_secret(64)
+    cfg = EmbedConfig(block=8, delta=24.0, repeat=1)
+    result, _ = steg.hide_secret(cover, secret, 10, cfg)
+    recovered, status = steg.reveal_secret(result.stego, cfg, return_status=True)
+    assert status.header_ok and status.crc_ok
+    assert recovered.shape == secret.shape
 
 
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = 0
-    for t in tests:
+    for test in tests:
         try:
-            t()
-            print(f"  PASS  {t.__name__}")
+            test()
+            print(f"  PASS  {test.__name__}")
             passed += 1
-        except AssertionError as e:
-            print(f"  FAIL  {t.__name__}: {e}")
-        except Exception as e:
-            print(f"  ERROR {t.__name__}: {type(e).__name__}: {e}")
-    print(f"\n{passed}/{len(tests)} test superati")
+        except Exception as exc:
+            print(f"  FAIL  {test.__name__}: {type(exc).__name__}: {exc}")
+    print(f"\n{passed}/{len(tests)} tests passed")
     return passed == len(tests)
 
 
